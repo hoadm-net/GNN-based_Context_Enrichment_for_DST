@@ -151,11 +151,31 @@ checkpoints/
 # Logs
 logs/
 *.log
+training*.log
 
 # Temporary files
 temp/
 tmp/
 .DS_Store
+
+# Output directories
+outputs/
+results/
+
+# Intermediate documentation (keep only ARC.md and README.md)
+HYBRID_DESIGN.md
+REFACTORING_SUMMARY.md
+GRAPH_DST.md
+
+# Old/debug scripts
+simple_test.py
+analyze_slots.py
+train.py
+validate.py
+
+# Test results
+*_test_results.json
+final_test_results.json
 
 # Jupyter notebook outputs
 *.ipynb

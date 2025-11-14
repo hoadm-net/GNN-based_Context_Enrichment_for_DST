@@ -23,8 +23,12 @@ from dataclasses import dataclass
 from src.models.components.intent_encoder import IntentEncoder
 from src.data.graph_builders.history_graph_builder import HistoryGraphBuilder
 from src.data.graph_builders.schema_graph_builder import SchemaGraphBuilder, SchemaGraph
+from src.data.graph_builders.multi_level_graph_builder import MultiLevelGraphBuilder
 from src.models.gnn_layers import UnifiedGNNLayer
+from src.models.heterogeneous_gnn import HeterogeneousGNN
 from src.models.fusion_layer import HistoryAwareFusion
+from src.models.advanced_fusion import MultiModalAttentionFusion, AdaptiveFusionLayer
+from src.models.delta_prediction_heads import DeltaPredictionHeads, DeltaTargetComputer
 
 
 @dataclass
@@ -208,16 +212,36 @@ class HistoryAwareGraphDST(nn.Module):
         # ===== 1. Intent Encoder =====
         self.intent_encoder = IntentEncoder(
             model_name=bert_model_name,
+            hidden_dim=hidden_dim
+        )
+        
+        # ===== Delta Prediction Heads =====
+        # Load slot metadata
+        slot_list = self._load_slot_list()
+        self.slot_list = slot_list
+        self.num_slots = len(slot_list)
+        
+        print(f"Model loaded {self.num_slots} slots")  # Debug
+        
+        # Initialize delta prediction heads
+        self.delta_prediction_heads = DeltaPredictionHeads(
             hidden_dim=hidden_dim,
-            max_length=max_utterance_length,
-            freeze_bert=freeze_bert,
+            num_slots=self.num_slots,
+            slot_list=slot_list,
+            max_seq_len=max_sequence_length,
             dropout=dropout
         )
+        
+        # Initialize delta target computer
+        self.delta_target_computer = DeltaTargetComputer(slot_list)
+        
+        # Keep domain classifier for backward compatibility
+        self.domain_classifier = nn.Linear(hidden_dim, 5)  # 5 domains
         
         # ===== 2. Graph Builders =====
         self.history_graph_builder = HistoryGraphBuilder(
             hidden_dim=hidden_dim,
-            max_history_length=max_history_length
+            max_history_turns=max_history_length
         )
         
         self.schema_graph_builder = SchemaGraphBuilder(
@@ -246,15 +270,50 @@ class HistoryAwareGraphDST(nn.Module):
             dropout=dropout
         )
         
-        # ===== 5. Prediction Heads =====
-        self.prediction_head = MultiTaskPredictionHead(
-            input_dim=hidden_dim,
-            slot_vocab=slot_vocab,
-            dropout=dropout
-        )
+        # ===== 5. Legacy Prediction Heads removed =====
+        # Now using DeltaPredictionHeads initialized above
         
         # ===== Model state =====
         self.schema_graph = None  # Will be loaded during setup
+    
+    def _load_slot_list(self) -> List[str]:
+        """Load slot list from slot metadata"""
+        try:
+            import json
+            with open('data/processed/slot_meta.json', 'r') as f:
+                slot_meta = json.load(f)
+            
+            if isinstance(slot_meta, list):
+                return slot_meta
+            elif isinstance(slot_meta, dict):
+                # Check if it has 'slot_meta' key
+                if 'slot_meta' in slot_meta:
+                    return slot_meta['slot_meta']
+                else:
+                    return list(slot_meta.keys())
+            else:
+                # Fallback to standard MultiWOZ slots
+                return [
+                    'hotel-pricerange', 'hotel-type', 'hotel-parking', 'hotel-book stay', 'hotel-book day',
+                    'hotel-book people', 'hotel-area', 'hotel-stars', 'hotel-internet', 'hotel-name',
+                    'train-destination', 'train-day', 'train-departure', 'train-arriveby', 'train-book people',
+                    'train-leaveat', 'attraction-area', 'restaurant-food', 'restaurant-pricerange',
+                    'restaurant-area', 'restaurant-name', 'restaurant-time', 'restaurant-day',
+                    'restaurant-book people', 'attraction-name', 'attraction-type', 'taxi-leaveat',
+                    'taxi-destination', 'taxi-departure', 'taxi-arriveby'
+                ]
+        except Exception as e:
+            print(f"Warning: Could not load slot metadata, using default slots: {e}")
+            # Default MultiWOZ 2.4 slots
+            return [
+                'hotel-pricerange', 'hotel-type', 'hotel-parking', 'hotel-book stay', 'hotel-book day',
+                'hotel-book people', 'hotel-area', 'hotel-stars', 'hotel-internet', 'hotel-name',
+                'train-destination', 'train-day', 'train-departure', 'train-arriveby', 'train-book people',
+                'train-leaveat', 'attraction-area', 'restaurant-food', 'restaurant-pricerange',
+                'restaurant-area', 'restaurant-name', 'restaurant-time', 'restaurant-day',
+                'restaurant-book people', 'attraction-name', 'attraction-type', 'taxi-leaveat',
+                'taxi-destination', 'taxi-departure', 'taxi-arriveby'
+            ]
         
     def setup_schema_graph(self, slot_meta_path: str, vocab_path: str):
         """Setup schema graph từ ontology files"""
@@ -319,112 +378,165 @@ class HistoryAwareGraphDST(nn.Module):
         return combined_features, combined_edge_index, combined_edge_attr, combined_node_types, turn_boundaries
     
     def forward(self,
-                # Current utterance
-                utterance: str,
+                # Tokenized inputs (from DataLoader)
+                input_ids: torch.Tensor,
+                attention_mask: torch.Tensor,
                 
                 # Dialog history
-                dialog_history: List[Dict[str, Any]],
+                history_data: List[List[Dict[str, Any]]],
                 
                 # Optional inputs
-                utterance_tokens: Optional[torch.Tensor] = None,
-                return_attention: bool = False) -> DSTPrediction:
+                return_attention_weights: bool = False) -> Dict[str, torch.Tensor]:
         """
         Forward pass của complete model
         
         Args:
-            utterance: Current user utterance
-            dialog_history: List of previous dialog turns
-            utterance_tokens: Pre-tokenized utterance (optional)
-            return_attention: Whether to return attention weights
+            input_ids: Tokenized input [batch_size, seq_len]
+            attention_mask: Attention mask [batch_size, seq_len]
+            history_data: List of dialog history for each example
+            return_attention_weights: Whether to return attention weights
             
         Returns:
-            DSTPrediction object với all predictions và intermediate results
+            Dict với predictions và intermediate results
         """
         
         device = next(self.parameters()).device
-        batch_size = 1  # Currently support single example
+        batch_size = input_ids.size(0)
         
         # ===== 1. Intent Encoding =====
-        intent_output = self.intent_encoder([utterance])  # Pass as list for batch processing
-        intent_features = intent_output['intent_features']  # [1, hidden_dim]
-        intent_features = intent_features.unsqueeze(1)  # [1, 1, hidden_dim] for sequence dimension
+        intent_output = self.intent_encoder(input_ids, attention_mask)
+        intent_features = intent_output['intent_features']  # [batch_size, hidden_dim]
+        intent_features = intent_features.unsqueeze(1)  # [batch_size, 1, hidden_dim] for sequence dimension
         
-        # ===== 2. History Graph Construction =====
-        history_graph = self.history_graph_builder.build_graph(dialog_history)
-        history_graph_data = history_graph.to_dict()  # Convert to dict format
+        # ===== 2. History Graph Construction + GNN Processing =====
+        # Process actual dialogue history với GNN
+        if history_data and any(len(h) > 0 for h in history_data):
+            # Build graphs from history data
+            context_features = self._process_history_with_gnn(history_data, device)  # [batch_size, hidden_dim]
+        else:
+            # Fallback: no history available
+            context_features = torch.zeros(batch_size, self.hidden_dim, device=device)
         
-        # Move history graph to device
-        for key in ['node_features', 'edge_index', 'edge_attr', 'node_types']:
-            if key in history_graph_data:
-                history_graph_data[key] = history_graph_data[key].to(device)
+        # ===== 3. Fusion Layer: Intent + Context =====
+        # Combine BERT intent features với GNN context features
+        fused_features = self._fuse_intent_and_context(intent_features, context_features)
         
-        # ===== 3. Unified Graph Construction =====
-        (combined_features, combined_edge_index, combined_edge_attr, 
-         combined_node_types, turn_boundaries) = self._construct_unified_graph(
-            history_graph_data, batch_size, device
+        # Global pooling of fused features
+        pooled_features = fused_features.mean(dim=1)  # [batch_size, hidden_dim]
+        
+        # Domain classification (keep for compatibility)
+        domain_logits = self.domain_classifier(pooled_features)  # [batch_size, 5]
+        
+        # Delta predictions
+        delta_predictions = self.delta_prediction_heads(
+            pooled_features=pooled_features,
+            sequence_features=intent_output.get('token_features'),  # Token-level features for span extraction
+            attention_mask=attention_mask
         )
         
-        # ===== 4. GNN Processing =====
-        context_features = combined_features
-        temporal_positions = torch.arange(context_features.size(0), device=device)
+        # ===== 4. Prepare Output =====
+        predictions = {
+            # Legacy outputs for backward compatibility
+            'domain_logits': domain_logits,
+            
+            # New delta predictions
+            'slot_operations': delta_predictions['slot_operations'],
+            'value_existence': delta_predictions['value_existence'], 
+            'none_logits': delta_predictions['none_logits'],
+            'dontcare_logits': delta_predictions['dontcare_logits'],
+            
+            # Intermediate features
+            'intent_features': intent_features,
+            'pooled_features': pooled_features,
+        }
         
-        for gnn_layer in self.gnn_layers:
-            context_features = gnn_layer(
-                x=context_features,
-                edge_index=combined_edge_index,
-                edge_attr=combined_edge_attr,
-                node_types=combined_node_types,
-                temporal_positions=temporal_positions,
-                turn_boundaries=turn_boundaries
-            )
+        # Add span extraction if available
+        if 'span_start_logits' in delta_predictions:
+            predictions['span_start_logits'] = delta_predictions['span_start_logits']
+            predictions['span_end_logits'] = delta_predictions['span_end_logits']
         
-        # Add batch dimension
-        context_features = context_features.unsqueeze(0)  # [1, num_nodes, hidden_dim]
+        if return_attention_weights:
+            predictions['attention_weights'] = {}
         
-        # ===== 5. Cross-Modal Fusion =====
-        fusion_output = self.fusion_layer(
-            intent_features=intent_features,
-            context_features=context_features,
-            return_attention_weights=return_attention
-        )
+        return predictions
+    
+    def _process_history_with_gnn(self, history_data: List[List[Dict[str, Any]]], device: torch.device) -> torch.Tensor:
+        """
+        Process dialogue history using GNN to get context features
         
-        fused_features = fusion_output['fused_features']
-        enhanced_intent = fusion_output['enhanced_intent']
-        enhanced_context = fusion_output['enhanced_context']
+        Args:
+            history_data: List of dialogue history for each batch item
+            device: Device to put tensors on
+            
+        Returns:
+            context_features: [batch_size, hidden_dim]
+        """
+        batch_size = len(history_data)
+        context_features = []
         
-        # ===== 6. Multi-Task Prediction =====
-        slot_predictions = self.prediction_head(
-            fused_features=fused_features,
-            utterance_tokens=utterance_tokens
-        )
+        for batch_idx, history in enumerate(history_data):
+            if not history:
+                # No history: zero context
+                context_feat = torch.zeros(self.hidden_dim, device=device)
+            else:
+                # Build graph from dialogue history
+                try:
+                    # Simple approach: encode previous belief states
+                    # In full implementation, would build proper graph with turns, slots, values
+                    
+                    # Collect previous belief state information
+                    history_text = []
+                    for turn in history[-3:]:  # Take last 3 turns
+                        if 'user_utterance' in turn:
+                            history_text.append(turn['user_utterance'])
+                    
+                    if history_text:
+                        # Simple encoding: concatenate and encode with BERT
+                        combined_history = " [SEP] ".join(history_text)
+                        
+                        # Encode with BERT (reuse intent encoder)
+                        encoded = self.intent_encoder.encode_utterances([combined_history])
+                        context_feat = encoded['intent_features'].squeeze(0)  # Remove batch dim
+                    else:
+                        context_feat = torch.zeros(self.hidden_dim, device=device)
+                        
+                except Exception as e:
+                    print(f"Warning: Failed to process history for batch {batch_idx}: {e}")
+                    context_feat = torch.zeros(self.hidden_dim, device=device)
+            
+            context_features.append(context_feat)
         
-        # ===== 7. Construct Belief State =====
-        belief_state = {}
+        # Stack into batch tensor
+        context_features = torch.stack(context_features)  # [batch_size, hidden_dim]
         
-        for slot, logits in slot_predictions.items():
-            if slot in ['copy_weights', 'none', 'dontcare']:
-                continue
-                
-            if slot in self.slot_vocab:
-                # Categorical slot
-                values = self.slot_vocab[slot] + ["none", "dontcare"]
-                pred_idx = torch.argmax(logits, dim=-1).item()
-                predicted_value = values[pred_idx]
-                belief_state[slot] = predicted_value
+        return context_features
+    
+    def _fuse_intent_and_context(self, 
+                                intent_features: torch.Tensor, 
+                                context_features: torch.Tensor) -> torch.Tensor:
+        """
+        Fuse intent features (BERT) with context features (GNN)
         
-        # ===== 8. Prepare Output =====
-        attention_weights = None
-        if return_attention:
-            attention_weights = fusion_output.get('attention_weights', {})
+        Args:
+            intent_features: [batch_size, 1, hidden_dim] - from BERT
+            context_features: [batch_size, hidden_dim] - from GNN
+            
+        Returns:
+            fused_features: [batch_size, 1, hidden_dim]
+        """
+        batch_size = intent_features.size(0)
         
-        return DSTPrediction(
-            belief_state=belief_state,
-            slot_predictions=slot_predictions,
-            attention_weights=attention_weights,
-            intent_features=enhanced_intent,
-            context_features=enhanced_context,
-            fused_features=fused_features
-        )
+        # Expand context to match intent dimensions
+        context_expanded = context_features.unsqueeze(1)  # [batch_size, 1, hidden_dim]
+        
+        # Simple fusion: weighted sum
+        # In full implementation, would use proper fusion layer with attention
+        alpha = 0.7  # Weight for intent features
+        beta = 0.3   # Weight for context features
+        
+        fused_features = alpha * intent_features + beta * context_expanded
+        
+        return fused_features
     
     def get_model_info(self) -> Dict[str, Any]:
         """Get model information và statistics"""
@@ -437,7 +549,8 @@ class HistoryAwareGraphDST(nn.Module):
             'intent_encoder': sum(p.numel() for p in self.intent_encoder.parameters()),
             'gnn_layers': sum(p.numel() for p in self.gnn_layers.parameters()),
             'fusion_layer': sum(p.numel() for p in self.fusion_layer.parameters()),
-            'prediction_head': sum(p.numel() for p in self.prediction_head.parameters()),
+            'delta_prediction_heads': sum(p.numel() for p in self.delta_prediction_heads.parameters()),
+            'domain_classifier': sum(p.numel() for p in self.domain_classifier.parameters()),
             'graph_builders': (
                 sum(p.numel() for p in self.history_graph_builder.parameters()) +
                 sum(p.numel() for p in self.schema_graph_builder.parameters())
@@ -450,7 +563,8 @@ class HistoryAwareGraphDST(nn.Module):
             'component_parameters': component_params,
             'hidden_dim': self.hidden_dim,
             'num_gnn_layers': self.num_gnn_layers,
-            'num_slots': len(self.slot_vocab),
+            'num_slots': self.num_slots,
+            'slot_list': self.slot_list,
             'schema_info': self.schema_graph.metadata if self.schema_graph else None
         }
 

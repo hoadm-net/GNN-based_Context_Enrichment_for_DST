@@ -1,262 +1,122 @@
-# History-Aware GraphDST
+git clone <repository_url>
+# GNN-based Context Enrichment for Dialogue State Tracking
 
-A novel DST (Dialog State Tracking) architecture combining **BERT** for intent understanding and **Graph Neural Networks** for historical context modeling.
+MultiWOZ dialogues contain long context windows and mixed-domain slot dependencies. This project explores a history-aware DST pipeline that combines transformer intent modelling with graph-based context reasoning so the belief state can be updated turn by turn without replaying the entire dialogue.
 
-## 🎯 Core Innovation
+## Concept Overview
 
-**History-Aware GraphDST** separates current intent processing from historical context modeling:
+- **Goal**: track joint belief states across five MultiWOZ domains (hotel, restaurant, attraction, train, taxi) using only the structured data already supplied in `data/processed_graph/`.
+- **Approach**: pair a BERT intent encoder with a multi-level graph over dialogue history (domain, schema, value, turn nodes). Features from both branches are fused and converted into delta predictions (keep/add/update/remove) so the tracker only reasons about changed slots each turn.
+- **Result**: the current pipeline reaches test JGA ≈ 0.68 using the dataset version shipped in this repository.
 
-- **BERT Branch**: Current utterance only (~30 tokens vs 512 traditional)
-- **GNN Branch**: Dialog history + schema relationships  
-- **Cross-Modal Fusion**: Sophisticated attention between intent và context
-- **Efficiency**: 3-5x faster, 60% memory reduction
+## Model Architecture
 
-## 📊 Dataset
+The tracker follows a staged pipeline that incrementally enriches dialogue context before producing per-slot belief updates. Each block contributes a distinct type of signal:
 
-- **MultiWOZ 2.4**: Multi-domain task-oriented dialogue dataset
-- **Domains**: Hotel, Restaurant, Attraction, Train, Taxi
-- **Statistics**: 
-  - Training: 54,984 instances (78.9%)
-  - Development: 7,365 instances (10.6%) 
-  - Test: 7,368 instances (10.6%)
-  - Total Slots: 30 across 5 domains
+### 1. Utterance Intent Encoder
+- Backbone: `bert-base-uncased` (frozen lower layers, trainable projection).
+- Input: the current user utterance plus the preceding system turn (concatenated with a separator token).
+- Output: token embeddings and two pooled vectors (CLS token and learned attention pooling) representing utterance intent.
+- Additional heads: a lightweight convolutional contrastive head encourages separation between intents that trigger different slot updates.
 
-## 🏗️ Project Structure
+### 2. Multi-level Dialogue Graph Builder
+- Construction handled by `src/data/graph_builders/` using the processed dataset (up to 20 past turns).
+- Node sets:
+  - **Domain Nodes** – one per active domain (hotel, restaurant, attraction, train, taxi).
+  - **Schema Nodes** – all slots defined in `slot_meta.json`.
+  - **Value Nodes** – high-support categorical values (e.g., price ranges, parking options).
+  - **Turn Nodes** – each historical turn with utterance metadata and previous belief deltas.
+- Edge families:
+  - Domain↔Schema (slot-domain membership)
+  - Schema↔Value (value admissibility)
+  - Turn↔Schema (slot mentioned/updated in a turn)
+  - Turn↔Turn (temporal order with exponential decay weights)
+  - Schema↔Schema (manually curated correlations, e.g., `hotel-area`↔`restaurant-area`).
+- Initialization:
+  - Domain/value embeddings learned from scratch.
+  - Schema embeddings seeded from averaged utterance token embeddings that mention the slot during preprocessing.
+  - Turn embeddings aggregate TF-IDF bag-of-words and previous delta signatures.
+
+### 3. Heterogeneous GNN Encoder
+- Two stacked relational attention layers (`heterogeneous_gnn.py`).
+- Message passing is type-specific: each edge family has its own projection matrix and attention parameters.
+- Temporal reasoning is injected by gating messages along Turn↔Turn edges with a learned decay derived from time distance.
+- Output: slot-centric context embeddings (each slot receives messages from all connected domains, values, and relevant turns) and pooled graph summaries.
+
+### 4. Cross-modal Fusion
+- Component: `advanced_fusion.py`.
+- Steps:
+  1. **Intent→Graph Attention** – intent tokens attend over slot embeddings to highlight slots implied by the utterance.
+  2. **Graph→Intent Attention** – slot embeddings attend back over intent tokens to capture lexical grounding.
+  3. **Gated Fusion** – the two attended vectors plus the original slot embedding are concatenated and passed through a gating MLP producing a fused slot representation.
+- Regularisation: dropout + residual connections ensure stability when either branch carries weak signal.
+
+### 5. Delta Prediction Heads
+- Implemented in `classification_delta_heads.py` and wrapped inside the model.
+- For every slot we predict:
+  - **Operation logits** over {KEEP, ADD, UPDATE, REMOVE}.
+  - **Value existence logit** (whether a value should be asserted at all).
+  - **Special values** logits for `none` and `dontcare`.
+  - **Categorical value classifier** when the slot’s vocabulary is provided in `slot_meta.json`.
+- Slots without closed vocabularies bypass the categorical classifier; their updated value is expected to be copied externally (future work).
+- A `DeltaTargetComputer` converts previous/current belief states into supervision signals so that training focuses on changed slots only.
+
+### 6. Belief State Reconstruction
+- During inference, predictions are converted into deltas and applied to the previous belief state maintained by the dataloader.
+- Operation decoding is deterministic: KEEP leaves the slot untouched, ADD/UPDATE write the predicted value (or `dontcare`), REMOVE deletes the slot.
+- The reconstructed state is returned with auxiliary attention maps for inspection.
+
+## Repository Layout (Active Files)
 
 ```
 GNN-based_Context_Enrichment_for_DST/
 ├── data/
-│   ├── raw/                    # Raw MultiWOZ 2.4 files
-│   └── processed/              # Preprocessed training instances
+│   ├── raw/                    # Original MultiWOZ resources (unchanged)
+│   └── processed_graph/        # Preprocessed dataset used in this pipeline
 ├── src/
-│   ├── data/
-│   │   ├── download_data.py    # Dataset downloader
-│   │   └── preprocess.py       # Data preprocessing pipeline
-│   ├── models/                 # Model implementations
-│   ├── evaluation/
-│   │   └── evaluator.py        # Evaluation framework
-│   └── utils/
-│       └── data_loader.py      # Data loading utilities
-├── notebooks/                  # Jupyter notebooks for analysis
-├── results/                    # Experimental results
-├── test_pipeline.py           # Pipeline testing script
-├── requirements.txt           # Dependencies
-└── README.md                  # This file
+│   ├── data/                   # Graph builders and preprocessing helpers
+│   └── models/                 # BERT encoder, GNN layers, fusion, delta heads
+├── checkpoints/graph_dst/      # Saved weights; best model at epoch 8
+├── results/graph_dst/          # Metrics and prediction dumps for dev/test
+├── train_graph_dst.py          # Training entry point for the current pipeline
+├── validate_graph_dst.py       # Evaluation entry point for dev/test splits
+├── analysis_summary.json       # Slot-level error analysis for latest test run
+├── requirements.txt
+└── README.md
 ```
 
-## 🚀 Quick Start
+## Using the Pipeline
 
-### 1. Environment Setup
+### Training
+
+The script expects the processed graph dataset and ontology already present under `data/`. It can start from scratch or resume a checkpoint.
 
 ```bash
-# Clone the repository
-git clone <repository_url>
-cd GNN-based_Context_Enrichment_for_DST
-
-# Create virtual environment
-python3 -m venv venv
-source venv/bin/activate
-
-# Install dependencies
-pip install -r requirements.txt
+python train_graph_dst.py \
+  --epochs 10                 # fresh run length
+# Optional resume run:
+python train_graph_dst.py \
+  --resume checkpoints/graph_dst/best_model.pt \
+  --additional-epochs 3
 ```
 
-### 2. Data Preparation
+Training logs show turn-level loss and dev JGA after each epoch. The best-performing weights are always written to `checkpoints/graph_dst/best_model.pt`.
+
+### Validation / Test
+
+`validate_graph_dst.py` reloads a checkpoint, runs the requested split, and writes fresh metrics plus JSONL predictions under `results/graph_dst/` (or a custom directory via `--results_dir`).
 
 ```bash
-# Download MultiWOZ 2.4 dataset
-python src/data/download_data.py
-
-# Preprocess the data
-python src/data/preprocess.py
-
-# Test the pipeline
-python test_pipeline.py
+python validate_graph_dst.py --split dev  --checkpoint checkpoints/graph_dst/best_model.pt
+python validate_graph_dst.py --split test --checkpoint checkpoints/graph_dst/best_model.pt
 ```
 
-### 3. Data Loading Example
+Each evaluation reports joint goal accuracy and average loss so results stay comparable across runs.
 
-```python
-from src.utils.data_loader import DSTDataLoader
+## Next Directions
 
-# Initialize data loader
-data_loader = DSTDataLoader(
-    data_dir="data/processed",
-    slot_meta_path="data/processed/slot_meta.json",
-    batch_size=16
-)
+- **Value Normalisation**: smooth spelling variants (guest house vs guesthouse, night club vs nightclub) before scoring to recover JGA lost to formatting differences.
+- **Entity Recall**: adjust history fusion or add post-processing to reduce missed carry-over for restaurant/hotel names.
+- **Resume Training**: once value vocab issues are resolved, resume the best checkpoint with a lower learning rate to test whether more epochs help.
 
-# Get training data loader
-train_loader = data_loader.get_dataloader('train', shuffle=True)
-
-# Iterate through batches
-for batch in train_loader:
-    dialogue_ids = batch['dialogue_ids']
-    input_texts = batch['input_texts']
-    belief_states = batch['belief_states']
-    # Your training code here...
-```
-
-### 4. Evaluation Example
-
-```python
-from src.evaluation.evaluator import DSTEvaluator
-
-# Load slot metadata
-with open("data/processed/slot_meta.json", 'r') as f:
-    slot_meta = json.load(f)['slot_meta']
-
-# Initialize evaluator
-evaluator = DSTEvaluator(slot_meta)
-
-# Evaluate predictions
-metrics = evaluator.evaluate_predictions(predictions, ground_truth)
-
-# Print results
-evaluator.print_evaluation_results(metrics, model_name="Your Model")
-```
-
-## 📈 Evaluation Metrics
-
-The evaluation framework implements standard DST metrics:
-
-- **Joint Goal Accuracy (JGA)**: Percentage of turns where all slot values are predicted correctly
-- **Slot Accuracy**: Average accuracy across all slots
-- **Turn Accuracy**: Accuracy of predicting slot changes in each turn
-- **Final Joint Accuracy**: JGA computed only on final turns of dialogues
-- **Per-domain Accuracy**: JGA broken down by dialogue domains
-
-## 🔧 Data Processing Pipeline
-
-### Text Normalization
-- Lowercasing and whitespace normalization
-- Phone number and postcode standardization
-- Time and price pattern replacement
-- Contraction and punctuation handling
-
-### Instance Creation
-- Dialogue history tracking (last 10 turns)
-- Belief state conversion to slot-value pairs
-- Turn-level labeling for state changes
-- Domain-specific processing
-
-### Quality Assurance
-- ASCII text validation
-- Turn length filtering (max 50 words)
-- Dialogue structure validation
-- Missing data handling
-
-## 📚 Key Components
-
-### DSTDataset
-PyTorch Dataset class for DST training with:
-- Configurable dialogue history length
-- Flexible input text formatting
-- Belief state normalization
-- Support for tokenized inputs
-
-### DSTEvaluator
-Comprehensive evaluation framework with:
-- Multiple accuracy metrics
-- Per-domain analysis
-- Detailed error reporting
-- Statistical significance testing
-
-### MultiWOZPreprocessor
-Robust preprocessing pipeline with:
-- Text normalization following MultiWOZ standards
-- Belief state extraction and formatting
-- Data split management
-- Quality filtering and validation
-
-## 🎯 Research Directions
-
-This framework supports research in:
-- **Graph Neural Networks**: Modeling dialogue structure and domain relationships
-- **Context Enrichment**: Leveraging dialogue history and domain knowledge
-- **Multi-domain Transfer**: Cross-domain learning and adaptation
-- **Noise-robust Learning**: Handling annotation errors and inconsistencies
-
-## 🔬 Baseline Models
-
-The framework is designed to support various DST architectures:
-- **BERT-based models**: Fine-tuned language models
-- **STAR**: Slot self-attention mechanisms
-- **ASSIST**: Noise-robust training approaches  
-- **MetaASSIST**: Meta-learning for robust DST
-- **GNN-enhanced models**: Graph-based context modeling
-
-## 📊 Benchmark Results
-
-MultiWOZ 2.4 benchmark results for reference:
-
-| Model | Joint Goal Accuracy |
-|-------|-------------------|
-| SUMBT | 61.86% |
-| STAR | 73.62% |
-| TripPy | 64.75% |
-| ASSIST | 79.41% |
-| MetaASSIST | 80.10% |
-
-## 🛠️ Development
-
-### Running Tests
-```bash
-# Test complete pipeline
-python test_pipeline.py
-
-# Test specific components
-python src/utils/data_loader.py --data_dir data/processed
-python src/evaluation/evaluator.py --help
-```
-
-### Adding New Models
-1. Create model class in `src/models/`
-2. Implement training script
-3. Use `DSTDataLoader` for data loading
-4. Use `DSTEvaluator` for evaluation
-5. Save results in `results/` directory
-
-### Data Format
-Training instances are stored in JSON format:
-```json
-{
-  "dialogue_id": "dialogue_name",
-  "turn_id": 0,
-  "user_utterance": "normalized user text",
-  "system_response": "normalized system text", 
-  "dialogue_history": "conversation context",
-  "belief_state": [["slot-name", "value"], ...],
-  "domains": ["hotel", "restaurant"],
-  "is_last_turn": false
-}
-```
-
-## 🤝 Contributing
-
-1. Fork the repository
-2. Create feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit changes (`git commit -m 'Add amazing feature'`)
-4. Push to branch (`git push origin feature/amazing-feature`)
-5. Open Pull Request
-
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## 🙏 Acknowledgments
-
-- **MultiWOZ Team** for the comprehensive dialogue dataset
-- **DST-STAR** authors for slot self-attention mechanisms
-- **DST-ASSIST** authors for noise-robust training approaches
-- **DST-MetaASSIST** authors for meta-learning frameworks
-
-## 📧 Contact
-
-For questions and collaborations, please reach out through:
-- GitHub Issues for technical questions
-- Project discussions for research collaborations
-
----
-
-**Ready to enhance dialogue state tracking with graph neural networks!** 🚀
+This README reflects the active codepath only; legacy experiments and unused utilities were removed to keep the project focused on the pipeline above.

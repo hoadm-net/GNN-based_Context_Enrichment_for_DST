@@ -21,14 +21,16 @@ class IntentEncoder(nn.Module):
     - Cleaner intent signal: không bị nhiễu từ history
     """
     
-    def __init__(self, model_name: str = "bert-base-uncased", hidden_dim: int = 768):
+    def __init__(self, model_name: str = "bert-base-uncased", hidden_dim: int = 768, dropout: float = 0.1):
         super().__init__()
         
         self.model_name = model_name
         self.hidden_dim = hidden_dim
+        self.dropout = dropout
         
-        # BERT encoder
+        # BERT encoder và tokenizer
         self.bert = BertModel.from_pretrained(model_name)
+        self.tokenizer = BertTokenizer.from_pretrained(model_name)
         
         # Feature projection (if needed)
         bert_hidden_size = self.bert.config.hidden_size
@@ -79,12 +81,87 @@ class IntentEncoder(nn.Module):
         return {
             'intent_features': intent_features,
             'token_features': token_features,
+            'token_embeddings': token_features,  # Alias for compatibility
+            'attention_mask': attention_mask
+        }
+    
+    def encode_utterance(self, utterance: str, max_length: int = 128) -> Dict[str, torch.Tensor]:
+        """
+        Encode a single utterance
+        
+        Args:
+            utterance: Single utterance string
+            max_length: Maximum sequence length
+            
+        Returns:
+            Encoded features dictionary
+        """
+        return self.encode_utterances([utterance], self.tokenizer, max_length)
+    
+    def encode_utterance(self, 
+                        utterance: str, 
+                        max_length: int = 128) -> Dict[str, torch.Tensor]:
+        """
+        Encode single utterance
+        
+        Args:
+            utterance: Current user utterance
+            max_length: Maximum sequence length
+            
+        Returns:
+            Encoded features dictionary
+        """
+        # Validate input
+        if not utterance or not isinstance(utterance, str):
+            utterance = "[UNK]"  # Use unknown token for empty/invalid input
+        
+        utterance = utterance.strip()
+        if not utterance:
+            utterance = "[UNK]"
+        
+        # Tokenize
+        try:
+            inputs = self.tokenizer(
+                utterance,
+                return_tensors='pt',
+                max_length=max_length,
+                padding='max_length',
+                truncation=True
+            )
+        except Exception as e:
+            print(f"Tokenization error for utterance: '{utterance[:100]}' - {e}")
+            # Fallback: use simple text
+            inputs = self.tokenizer(
+                "[UNK]",
+                return_tensors='pt',
+                max_length=max_length,
+                padding='max_length',
+                truncation=True
+            )
+        
+        # Move tokenizer outputs to correct device
+        device = next(self.parameters()).device
+        input_ids = inputs['input_ids'].to(device)
+        attention_mask = inputs['attention_mask'].to(device)
+        
+        # BERT encoding
+        bert_outputs = self.bert(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            return_dict=True
+        )
+        
+        # Extract features
+        last_hidden_state = bert_outputs.last_hidden_state  # [1, seq_len, bert_hidden]
+        token_embeddings = self.feature_projection(last_hidden_state)  # [1, seq_len, hidden_dim]
+        
+        return {
+            'token_embeddings': token_embeddings,
             'attention_mask': attention_mask
         }
     
     def encode_utterances(self, 
                          utterances: List[str], 
-                         tokenizer: BertTokenizer,
                          max_length: int = 128) -> Dict[str, torch.Tensor]:
         """
         Encode a batch of utterances
